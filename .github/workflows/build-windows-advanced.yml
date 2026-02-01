@@ -1,0 +1,234 @@
+name: Build Windows Package (Advanced)
+
+on:
+  push:
+    branches:
+      - master
+      - windows-build
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Telegram版本 (e.g., 6.3.10)'
+        required: false
+        default: '6.3.10'
+      architecture:
+        description: '构建架构'
+        required: true
+        type: choice
+        options:
+          - 'both'
+          - 'x64'
+          - 'x86'
+        default: 'both'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        arch: [x64, x86]
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version
+        id: version
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.version }}" -eq "" ? "6.3.10" : "${{ github.event.inputs.version }}"
+          echo "telegram_version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Setup Visual Studio
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '17'
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            C:\tools\cmake
+            C:\ProgramData\chocolatey\lib
+          key: ${{ runner.os }}-deps-${{ matrix.arch }}-${{ hashFiles('**/PKGBUILD') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-${{ matrix.arch }}-
+
+      - name: Install dependencies
+        run: |
+          choco install cmake ninja nasm yasm perl strawberryperl git -y
+          refreshenv
+
+      - name: Download Telegram Desktop source
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.telegram_version }}"
+          Write-Output "下载 Telegram Desktop $version..."
+          $url = "https://github.com/telegramdesktop/tdesktop/releases/download/v$version/tdesktop-$version-full.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile "tdesktop.tar.gz" -ErrorAction Stop
+          tar -xzf tdesktop.tar.gz
+          Remove-Item tdesktop.tar.gz
+
+      - name: Clone TDLib
+        shell: cmd
+        run: |
+          echo 正在克隆 TDLib...
+          git clone --depth 1 --branch v1.8.34 https://github.com/tdlib/td.git
+
+      - name: Apply patches
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.telegram_version }}"
+          cd "tdesktop-${version}-full"
+          echo "应用补丁..."
+          patch --forward --strip=1 -i "../remove-ads.patch" || {
+            echo "❌ 补丁应用失败"
+            exit 1
+          }
+          echo "✅ 补丁已应用"
+
+      - name: Build TDLib
+        shell: cmd
+        run: |
+          echo ===== 正在编译 TDLib =====
+          mkdir td\build
+          cd td\build
+          set ARCH=${{ matrix.arch == 'x64' && 'x64' || 'Win32' }}
+          cmake .. -G "Visual Studio 17 2022" -A %ARCH% ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DTD_E2E_ONLY=ON ^
+            -DBUILD_SHARED_LIBS=OFF
+          if errorlevel 1 exit /b 1
+          msbuild /m td.sln /p:Configuration=Release /p:Platform=%ARCH% /p:WarningLevel=3
+          if errorlevel 1 exit /b 1
+          echo ✅ TDLib 编译完成
+
+      - name: Build Telegram Desktop
+        shell: cmd
+        run: |
+          echo ===== 正在编译 Telegram Desktop =====
+          version="${{ steps.version.outputs.telegram_version }}"
+          mkdir build
+          cd build
+          set ARCH=${{ matrix.arch == 'x64' && 'x64' || 'Win32' }}
+          cmake ..\tdesktop-6.3.10-full -G "Visual Studio 17 2022" -A !ARCH! ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DTDESKTOP_API_ID=611335 ^
+            -DTDESKTOP_API_HASH=d524b414d21f4d37f08684c1df41ac9c ^
+            -DDESKTOP_APP_USE_PACKAGED=OFF ^
+            -DCMAKE_C_FLAGS="/W3" ^
+            -DCMAKE_CXX_FLAGS="/W3"
+          if errorlevel 1 exit /b 1
+          msbuild /m Telegram.sln /p:Configuration=Release /p:Platform=!ARCH! /p:WarningLevel=3
+          if errorlevel 1 exit /b 1
+          echo ✅ Telegram Desktop 编译完成
+
+      - name: Create portable package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.telegram_version }}"
+          $arch = "${{ matrix.arch }}"
+          $buildDir = "build"
+          
+          if (!(Test-Path "$buildDir/Release")) {
+            Write-Error "编译目录不存在"
+            exit 1
+          }
+          
+          $outputDir = "release/Telegram-no-ads-${version}-${arch}"
+          New-Item -ItemType Directory -Force -Path "$outputDir" | Out-Null
+          
+          Copy-Item "$buildDir/Release/Telegram.exe" "$outputDir/" -Force
+          Get-ChildItem "$buildDir/Release" -Filter "*.dll" | Copy-Item -Destination "$outputDir/" -Force
+          
+          Write-Output "✅ Portable包已创建: $outputDir"
+
+      - name: Create compressed archive
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.telegram_version }}"
+          $arch = "${{ matrix.arch }}"
+          $outputDir = "release/Telegram-no-ads-${version}-${arch}"
+          $archiveName = "telegram-no-ads-${version}-${arch}-portable.zip"
+          
+          Compress-Archive -Path "$outputDir" -DestinationPath "release/$archiveName" -Force
+          Write-Output "✅ 存档已创建: release/$archiveName"
+
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.telegram_version }}"
+          $arch = "${{ matrix.arch }}"
+          $archiveName = "telegram-no-ads-${version}-${arch}-portable.zip"
+          
+          $hash = (Get-FileHash "release/$archiveName" -Algorithm SHA256).Hash
+          Set-Content -Path "release/${archiveName}.sha256" -Value "$hash  $archiveName"
+          
+          Write-Output "✅ 校验和已生成"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-no-ads-windows-${{ matrix.arch }}
+          path: release/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: release/**/*
+          tag_name: v${{ steps.version.outputs.telegram_version }}-windows
+          body: |
+            # Telegram Desktop No-Ads v${{ steps.version.outputs.telegram_version }}
+            
+            Windows构建 - ${{ matrix.arch }}架构
+            
+            ## 下载
+            - `telegram-no-ads-${{ steps.version.outputs.telegram_version }}-${{ matrix.arch }}-portable.zip` - 绿色版本(无需安装)
+            
+            ## 文件校验
+            所有文件都包含SHA256校验和，请验证文件完整性。
+            
+            ## 去广告功能
+            ✅ 禁用赞助消息
+            ✅ 禁用视频广告
+            ✅ 禁用反应
+            ✅ 禁用网页预览
+            ✅ 禁用故事
+            ✅ 其他优化
+            
+            ## 说明
+            1. 解压ZIP文件
+            2. 运行 `Telegram.exe`
+            3. 无需安装，可直接运行
+            
+            ---
+            构建时间: ${{ github.event.head_commit.timestamp }}
+            提交: ${{ github.sha }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+      - name: Build summary
+        run: |
+          echo "## 构建完成"
+          echo "✅ x64架构: ${{ needs.build.result == 'success' && '✓' || '✗' }}"
+          echo "✅ x86架构: ${{ needs.build.result == 'success' && '✓' || '✗' }}"
